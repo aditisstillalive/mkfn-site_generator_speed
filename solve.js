@@ -17,28 +17,12 @@ ESC[62] = '&gt;';
 ESC[34] = '&quot;';
 ESC[39] = '&#39;';
 
-/** `s` with & < > " and ' escaped. */
+const ESC_ANY = /[&<>"']/;
+
+/** `s` with & < > " and ' escaped (each pass native; & first, so no entity is escaped again). */
 function esc(s) {
-  const n = s.length;
-  let i = 0;
-  for (; i < n; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 63 && ESC[c] !== undefined) break;
-  }
-  if (i === n) return s;
-  let out = '';
-  let start = 0;
-  for (; i < n; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 63) {
-      const r = ESC[c];
-      if (r !== undefined) {
-        out += s.slice(start, i) + r;
-        start = i + 1;
-      }
-    }
-  }
-  return start === 0 ? out : out + s.slice(start);
+  if (!ESC_ANY.test(s)) return s;
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 const SLUG_MAX = 64;
@@ -301,258 +285,292 @@ const ESCAPABLE = new Uint8Array(128);
 for (const ch of '\\`*_[]()#+-.!>') ESCAPABLE[ch.charCodeAt(0)] = 1;
 const escapable = (c) => c < 128 && ESCAPABLE[c] === 1;
 
-/** The first "**" in s[from, to) outside a backslash escape, or -1. */
+// The scans below jump between the characters that matter with global regexps (test() and lastIndex), so plain text
+// is skipped in native code.
+const SPECIAL = /[\\`*[&<>"']/g;
+const STAR_OR_BS = /[\\*]/g;
+const BRACKET_OR_BS = /[\\\]]/g;
+/** The next index >= from, < to, of a char `re` matches, or -1. */
+function next(re, s, from, to) {
+  re.lastIndex = from;
+  if (!re.test(s)) return -1;
+  const j = re.lastIndex - 1;
+  return j < to ? j : -1;
+}
 function findDouble(s, from, to) {
-  for (let j = from; j <= to - 2; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92) {
-      if (j + 1 < to && escapable(s.charCodeAt(j + 1))) j++;
-      continue;
-    }
-    if (c === 42 && s.charCodeAt(j + 1) === 42) return j;
+  let j = from;
+  while (j <= to - 2) {
+    j = next(STAR_OR_BS, s, j, to);
+    if (j === -1) return -1;
+    if (s.charCodeAt(j) === 92) { j += j + 1 < to && escapable(s.charCodeAt(j + 1)) ? 2 : 1; continue; }
+    if (j + 1 < to && s.charCodeAt(j + 1) === 42) return j;
+    j++;
   }
   return -1;
 }
-
-/** The first "]" in s[from, to) outside a backslash escape, or -1. */
 function findBracket(s, from, to) {
-  for (let j = from; j < to; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92) {
-      if (j + 1 < to && escapable(s.charCodeAt(j + 1))) j++;
-      continue;
-    }
-    if (c === 93) return j;
-  }
-  return -1;
-}
-
-/** The first single * in s[from, to) (one whose run is not **), outside an escape, or -1. */
-function findSingleStar(s, from, to) {
-  for (let j = from; j < to; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92) {
-      if (j + 1 < to && escapable(s.charCodeAt(j + 1))) j++;
-      continue;
-    }
-    if (c !== 42) continue;
-    if (j + 1 < to && s.charCodeAt(j + 1) === 42) {
-      j++;
-      continue;
-    }
+  let j = from;
+  while (j < to) {
+    j = next(BRACKET_OR_BS, s, j, to);
+    if (j === -1) return -1;
+    if (s.charCodeAt(j) === 92) { j += j + 1 < to && escapable(s.charCodeAt(j + 1)) ? 2 : 1; continue; }
     return j;
   }
   return -1;
 }
-
-/** s[from, to) rendered inline (markdown.js inline); `link(target)` is a link's href. */
+function findSingleStar(s, from, to) {
+  let j = from;
+  while (j < to) {
+    j = next(STAR_OR_BS, s, j, to);
+    if (j === -1) return -1;
+    if (s.charCodeAt(j) === 92) { j += j + 1 < to && escapable(s.charCodeAt(j + 1)) ? 2 : 1; continue; }
+    if (j + 1 < to && s.charCodeAt(j + 1) === 42) { j += 2; continue; }
+    return j;
+  }
+  return -1;
+}
 function inline(s, from, to, link) {
   let out = '';
   let start = from;
   let i = from;
   while (i < to) {
+    SPECIAL.lastIndex = i;
+    if (!SPECIAL.test(s)) break;
+    i = SPECIAL.lastIndex - 1;
+    if (i >= to) break;
     const c = s.charCodeAt(i);
-    if (c > 96) {
-      i++;
-      continue;
-    }
     switch (c) {
       case 92: {
         if (i + 1 < to) {
           const n = s.charCodeAt(i + 1);
           if (escapable(n)) {
             out += s.slice(start, i) + (n === 62 ? '&gt;' : s[i + 1]);
-            i += 2;
-            start = i;
-            continue;
+            i += 2; start = i; continue;
           }
         }
-        i++;
-        continue;
+        i++; continue;
       }
       case 96: {
         if (start < i) out += s.slice(start, i);
         const j = s.indexOf('`', i + 1);
-        if (j > i + 1 && j < to) {
-          out += '<code>' + esc(s.slice(i + 1, j)) + '</code>';
-          i = j + 1;
-        } else {
-          out += '`';
-          i++;
-        }
-        start = i;
-        continue;
+        if (j > i + 1 && j < to) { out += '<code>' + esc(s.slice(i + 1, j)) + '</code>'; i = j + 1; }
+        else { out += '`'; i++; }
+        start = i; continue;
       }
       case 42: {
         if (start < i) out += s.slice(start, i);
         if (i + 1 < to && s.charCodeAt(i + 1) === 42) {
           const j = findDouble(s, i + 2, to);
-          if (j > i + 2) {
-            out += '<strong>' + inline(s, i + 2, j, link) + '</strong>';
-            i = j + 2;
-          } else {
-            out += '**';
-            i += 2;
-          }
+          if (j > i + 2) { out += '<strong>' + inline(s, i + 2, j, link) + '</strong>'; i = j + 2; }
+          else { out += '**'; i += 2; }
         } else {
           const j = findSingleStar(s, i + 1, to);
-          if (j > i + 1) {
-            out += '<em>' + inline(s, i + 1, j, link) + '</em>';
-            i = j + 1;
-          } else {
-            out += '*';
-            i++;
-          }
+          if (j > i + 1) { out += '<em>' + inline(s, i + 1, j, link) + '</em>'; i = j + 1; }
+          else { out += '*'; i++; }
         }
-        start = i;
-        continue;
+        start = i; continue;
       }
       case 91: {
         if (start < i) out += s.slice(start, i);
         const k = findBracket(s, i + 1, to);
         let m = -1;
-        if (k !== -1 && k + 1 < to && s.charCodeAt(k + 1) === 40) {
-          m = s.indexOf(')', k + 2);
-          if (m >= to) m = -1;
-        }
+        if (k !== -1 && k + 1 < to && s.charCodeAt(k + 1) === 40) { m = s.indexOf(')', k + 2); if (m >= to) m = -1; }
         const target = m === -1 ? '' : s.slice(k + 2, m);
-        if (target !== '' && !HAS_WS.test(target)) {
-          out += '<a href="' + esc(link(target)) + '">' + inline(s, i + 1, k, link) + '</a>';
-          i = m + 1;
-        } else {
-          out += '[';
-          i++;
-        }
-        start = i;
-        continue;
+        if (target !== '' && !HAS_WS.test(target)) { out += '<a href="' + esc(link(target)) + '">' + inline(s, i + 1, k, link) + '</a>'; i = m + 1; }
+        else { out += '['; i++; }
+        start = i; continue;
       }
-      case 38:
-      case 60:
-      case 62:
-      case 34:
-      case 39:
-        out += s.slice(start, i) + ESC[c];
-        i++;
-        start = i;
-        continue;
       default:
-        i++;
+        out += s.slice(start, i) + ESC[c];
+        i++; start = i;
     }
   }
   if (start < to) out += start === 0 && to === s.length ? s : s.slice(start, to);
   return out;
 }
 
-const inlineAll = (s, link) => inline(s, 0, s.length, link);
+// The block lexer works on positions in the body (a line starts at 0 and after each "\n", as split("\n") cuts them)
+// and makes a line's string only where its first character could open something other than a paragraph; ordinary
+// paragraph lines are skipped in native code (PARA_CAND).
 
-/** markdown.js renderMarkdown, lexing and rendering in one pass: { html, toc, excerpt }. */
+/** A "\n" whose next line could end a paragraph (blank, fence, heading or thematic break), or the last "\n". */
+const PARA_CAND = /\n(?=[ \t\n`#*-]|$)/g;
+/** A paragraph's text needs its lines trimmed. */
+const NEEDS_TRIM = /^[ \t]|[ \t]$|[ \t]\n|\n[ \t]/;
+/** A fence's closing line, from the "\n" before it. */
+const FENCE_CLOSE_G = /\n```[ \t]*(?=\n|$)/g;
+
+const lineEndOf = (src, p) => {
+  const e = src.indexOf('\n', p);
+  return e === -1 ? src.length : e;
+};
+
+/** Whether a line's first char code can only open a paragraph. */
+const plainStart = (c) => !(c === 32 || c === 9 || c === 96 || c === 35 || c === 45 || c === 42 || c === 62 || (c >= 48 && c <= 57));
+
+/** markdown.js renderMarkdown: { html, toc, excerpt }. */
 function renderMarkdown(src, link) {
-  const ids = new Set();
-  const toc = [];
-  let excerpt = null;
-  let html = '';
-  const lines = src.split('\n');
-  const n = lines.length;
-  let i = 0;
-  while (i < n) {
-    const line = lines[i];
-    const c0 = line.charCodeAt(0);
-    if ((c0 === 32 || c0 === 9 || line.length === 0) && isBlank(line)) {
-      i++;
+  const st = { src, link, html: '', toc: [], ids: new Set(), excerpt: null };
+  const n = src.length;
+  let p = 0;
+  while (p < n) {
+    const c0 = src.charCodeAt(p);
+    if (c0 === 10) {
+      p++;
       continue;
     }
-    if (c0 === 96) {
-      const fence = FENCE_OPEN.exec(line);
-      if (fence !== null) {
-        i++;
-        let body = '';
-        while (i < n) {
-          const l = lines[i];
-          if (l.charCodeAt(0) === 96 && FENCE_CLOSE.test(l)) break;
-          body += esc(l) + '\n';
-          i++;
-        }
-        i++;
-        const lang = fence[1];
-        html += (lang === '' ? '<pre><code>' : `<pre><code class="language-${esc(lang)}">`) + body + '</code></pre>\n';
-        continue;
-      }
-    }
-    if (c0 === 35) {
-      const h = headingOf(line, c0);
-      if (h !== null) {
-        const text = h[2];
-        const depth = h[1].length;
-        const id = uniqueSlug(slugify(text), ids);
-        const ih = inlineAll(text, link);
-        html += `<h${depth} id="${id}">${ih}</h${depth}>\n`;
-        if (depth === 2 || depth === 3) toc.push({ level: depth, id, html: ih });
-        i++;
-        continue;
-      }
-    }
-    if ((c0 === 45 || c0 === 42) && HR.test(line)) {
-      html += '<hr>\n';
-      i++;
+    if (plainStart(c0)) {
+      p = paragraph(st, p);
       continue;
     }
-    if (c0 === 62) {
-      let text = '';
-      let any = false;
-      while (i < n) {
-        const l = lines[i];
-        if (l.charCodeAt(0) !== 62) break;
-        const t = trimLine(l.slice(l.charCodeAt(1) === 32 ? 2 : 1));
-        if (t !== '') {
-          text = any ? text + '\n' + t : t;
-          any = true;
-        }
-        i++;
-      }
-      html += any ? `<blockquote>\n<p>${inlineAll(text, link)}</p>\n</blockquote>\n` : '<blockquote>\n</blockquote>\n';
-      continue;
-    }
-    let isList = false;
-    let isOrdered = false;
-    let first = null;
-    if (c0 === 45 || c0 === 42) {
-      first = BULLET.exec(line);
-      isList = first !== null;
-    }
-    if (!isList && c0 >= 48 && c0 <= 57) {
-      first = ORDERED.exec(line);
-      isList = isOrdered = first !== null;
-    }
-    if (isList) {
-      const marker = isOrdered ? ORDERED : BULLET;
-      let items = '';
-      let item = null;
-      while (i < n) {
-        const l = lines[i];
-        const lc = l.charCodeAt(0);
-        const m = (isOrdered ? lc >= 48 && lc <= 57 : lc === 45 || lc === 42) ? marker.exec(l) : null;
-        if (m !== null) {
-          if (item !== null) items += '<li>' + inlineAll(item, link) + '</li>\n';
-          item = trimLine(isOrdered ? m[2] : m[1]);
-          i++;
-        } else if (lc === 32 && l.charCodeAt(1) === 32 && CONTINUED.test(l)) {
-          item += '\n' + trimLine(l);
-          i++;
-        } else break;
-      }
-      items += '<li>' + inlineAll(item, link) + '</li>\n';
-      const start = isOrdered ? Number(first[1]) : 1;
-      html += (isOrdered ? (start !== 1 ? `<ol start="${start}">\n` : '<ol>\n') : '<ul>\n') + items + (isOrdered ? '</ol>\n' : '</ul>\n');
-      continue;
-    }
-    let text = trimLine(line);
-    i++;
-    while (i < n && !endsParagraph(lines[i])) text += '\n' + trimLine(lines[i++]);
-    const ih = inlineAll(text, link);
-    if (excerpt === null) excerpt = ih;
-    html += '<p>' + ih + '</p>\n';
+    p = otherBlock(st, p, c0);
   }
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html: st.html, toc: st.toc, excerpt: st.excerpt ?? '' };
+}
+
+/** The block at line start `p` whose first char code `c0` may open something other than a paragraph; the next line's start. */
+function otherBlock(st, p, c0) {
+  const src = st.src;
+  const e = lineEndOf(src, p);
+  const line = src.slice(p, e);
+  if ((c0 === 32 || c0 === 9) && isBlank(line)) return e + 1;
+  if (c0 === 96) {
+    const fence = FENCE_OPEN.exec(line);
+    if (fence !== null) return fenceBlock(st, e, fence[1]);
+  }
+  if (c0 === 35) {
+    const h = headingOf(line, c0);
+    if (h !== null) {
+      heading(st, h);
+      return e + 1;
+    }
+  }
+  if ((c0 === 45 || c0 === 42) && HR.test(line)) {
+    st.html += '<hr>\n';
+    return e + 1;
+  }
+  if (c0 === 62) return quote(st, p);
+  if (c0 === 45 || c0 === 42) {
+    const m = BULLET.exec(line);
+    if (m !== null) return list(st, p, false, m);
+  }
+  if (c0 >= 48 && c0 <= 57) {
+    const m = ORDERED.exec(line);
+    if (m !== null) return list(st, p, true, m);
+  }
+  return paragraph(st, p);
+}
+
+function heading(st, h) {
+  const text = h[2];
+  const depth = h[1].length;
+  const id = uniqueSlug(slugify(text), st.ids);
+  const ih = inline(text, 0, text.length, st.link);
+  st.html += `<h${depth} id="${id}">${ih}</h${depth}>\n`;
+  if (depth === 2 || depth === 3) st.toc.push({ level: depth, id, html: ih });
+}
+
+/** A fence opened by the line ending at `e`: its body up to a closing line or the end. */
+function fenceBlock(st, e, lang) {
+  const src = st.src;
+  const n = src.length;
+  let body;
+  let next;
+  if (e >= n) {
+    body = '';
+    next = n + 1;
+  } else {
+    FENCE_CLOSE_G.lastIndex = e;
+    const m = FENCE_CLOSE_G.exec(src);
+    if (m !== null) {
+      body = src.slice(e + 1, m.index + 1);
+      next = FENCE_CLOSE_G.lastIndex + 1;
+    } else {
+      body = src.slice(e + 1) + '\n';
+      next = n + 1;
+    }
+  }
+  st.html += (lang === '' ? '<pre><code>' : `<pre><code class="language-${esc(lang)}">`) + esc(body) + '</code></pre>\n';
+  return next;
+}
+
+/** A blockquote from line start `p`: every following line opening on ">". */
+function quote(st, p) {
+  const src = st.src;
+  const n = src.length;
+  let text = '';
+  let any = false;
+  while (p < n && src.charCodeAt(p) === 62) {
+    const e = lineEndOf(src, p);
+    const t = trimLine(src.slice(p + 1 < e && src.charCodeAt(p + 1) === 32 ? p + 2 : p + 1, e));
+    if (t !== '') {
+      text = any ? text + '\n' + t : t;
+      any = true;
+    }
+    p = e + 1;
+  }
+  st.html += any ? `<blockquote>\n<p>${inline(text, 0, text.length, st.link)}</p>\n</blockquote>\n` : '<blockquote>\n</blockquote>\n';
+  return p;
+}
+
+/** A list from line start `p`, whose first line matched as `first`. */
+function list(st, p, ordered, first) {
+  const src = st.src;
+  const n = src.length;
+  const marker = ordered ? ORDERED : BULLET;
+  let items = '';
+  let item = null;
+  while (p < n) {
+    const lc = src.charCodeAt(p);
+    const e = lineEndOf(src, p);
+    const m = (ordered ? lc >= 48 && lc <= 57 : lc === 45 || lc === 42) ? marker.exec(src.slice(p, e)) : null;
+    if (m !== null) {
+      if (item !== null) items += '<li>' + inline(item, 0, item.length, st.link) + '</li>\n';
+      item = trimLine(ordered ? m[2] : m[1]);
+    } else if (lc === 32 && src.charCodeAt(p + 1) === 32) {
+      const l = src.slice(p, e);
+      if (!CONTINUED.test(l)) break;
+      item += '\n' + trimLine(l);
+    } else break;
+    p = e + 1;
+  }
+  items += '<li>' + inline(item, 0, item.length, st.link) + '</li>\n';
+  if (ordered) {
+    const start = Number(first[1]);
+    st.html += (start !== 1 ? `<ol start="${start}">\n` : '<ol>\n') + items + '</ol>\n';
+  } else st.html += '<ul>\n' + items + '</ul>\n';
+  return p;
+}
+
+/** A paragraph from line start `p`, up to a line that ends it. */
+function paragraph(st, p) {
+  const src = st.src;
+  const n = src.length;
+  let end = lineEndOf(src, p);
+  while (end < n) {
+    PARA_CAND.lastIndex = end;
+    if (!PARA_CAND.test(src)) {
+      end = n;
+      break;
+    }
+    const q = PARA_CAND.lastIndex;
+    if (q === n) {
+      end = q - 1;
+      break;
+    }
+    const qe = lineEndOf(src, q);
+    if (endsParagraph(src.slice(q, qe))) {
+      end = q - 1;
+      break;
+    }
+    end = qe;
+  }
+  let text = src.slice(p, end);
+  if (NEEDS_TRIM.test(text)) text = text.split('\n').map(trimLine).join('\n');
+  const ih = inline(text, 0, text.length, st.link);
+  if (st.excerpt === null) st.excerpt = ih;
+  st.html += '<p>' + ih + '</p>\n';
+  return end + 1;
 }
 
 // ---------------------------------------------------------------- templates (template.js, compiled)

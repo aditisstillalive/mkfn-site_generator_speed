@@ -435,20 +435,32 @@ static Str jstr(void) {
     check_high(jp);
     jp++;
   }
-  // Escapes: decoded into what is left of the arena, which is then cut to the string's length.
+  // Escapes: decoded into what is left of the arena, which is then cut to the string's length. 16 bytes are moved at
+  // a time while 16 are left in the input; each block's first ", \\ or byte past ASCII stops it.
   char *out = A.cur;
   long room = A.end - A.cur;
   long n = jp - st;
-  if (n > room) unsupported();
+  if (n + 64 > room) unsupported();
   memcpy(out, st, n);
+  const __m128i Q = _mm_set1_epi8('"'), BS = _mm_set1_epi8('\\');
   for (;;) {
-    const u8 *r = scan_jstr(jp, je);
-    if (r >= je) unsupported();
-    long k = r - jp;
-    if (n + k + 8 > room) unsupported();
-    cpy(out + n, (const char *)jp, k);
-    n += k;
-    jp = r;
+    if (n + 32 > room) unsupported();
+    if (je - jp >= 16) {
+      __m128i x = _mm_loadu_si128((const __m128i *)jp);
+      _mm_storeu_si128((__m128i *)(out + n), x);
+      int m = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, Q), _mm_cmpeq_epi8(x, BS)), x));
+      if (m == 0) {
+        n += 16;
+        jp += 16;
+        continue;
+      }
+      int k = __builtin_ctz(m);
+      n += k;
+      jp += k;
+    } else {
+      while (jp < je && *jp != '"' && *jp != '\\' && *jp < 0x80) out[n++] = *jp++;
+      if (jp >= je) unsupported();
+    }
     u8 c = *jp;
     if (c == '"') {
       jp++;
@@ -464,12 +476,12 @@ static Str jstr(void) {
     u8 e = jp[1];
     jp += 2;
     switch (e) {
+      case 'n': out[n++] = '\n'; break;
       case '"': out[n++] = '"'; break;
       case '\\': out[n++] = '\\'; break;
       case '/': out[n++] = '/'; break;
       case 'b': out[n++] = '\b'; break;
       case 'f': out[n++] = '\f'; break;
-      case 'n': out[n++] = '\n'; break;
       case 'r': out[n++] = '\r'; break;
       case 't': out[n++] = '\t'; break;
       case 'u': {
@@ -903,7 +915,7 @@ struct Tag {
 
 enum { N_TEXT, N_VAR, N_RAW, N_IF, N_FOR, N_INC, N_CHUNK };
 typedef struct Node {
-  u8 kind, neg, has_else;
+  u8 kind, neg, has_else, elem; // elem: a for whose body reads nothing but its element, site, tags and recent
   int name;
   int *path;
   int plen;
@@ -1437,6 +1449,13 @@ static inline int is_static(const Node *n) {
   long budget = 20000;
   return stat_node(n, 0, 0, 0, &budget);
 }
+static int elem_n;
+static Map elem_text;
+static int has_include(const Node *n) {
+  for (; n; n = n->next)
+    if (n->kind == N_INC || (n->body && has_include(n->body)) || (n->els && has_include(n->els))) return 1;
+  return 0;
+}
 /** list with each maximal run of static nodes holding more than text made one chunk. */
 static Node *chunkify(Node *list) {
   Node *head = 0, **tail = &head;
@@ -1469,8 +1488,15 @@ static Node *chunkify(Node *list) {
     if (n->kind == N_IF) {
       n->body = chunkify(n->body);
       n->els = chunkify(n->els);
-    } else if (n->kind == N_FOR)
+    } else if (n->kind == N_FOR) {
+      long budget = 20000;
+      int b1[1] = { n->name };
+      if (has_include(n->body) && stat_list(n->body, b1, 1, 0, &budget)) {
+        n->elem = 1;
+        n->tpl = elem_n++;
+      }
       n->body = chunkify(n->body);
+    }
     *tail = n;
     tail = &n->next;
     n = next;
@@ -1499,6 +1525,31 @@ static void render(const Node *n, const Scope *sc, int depth) {
         s.name = n->name;
         s.sh = sc->sh || n->name == F_site || n->name == F_tags || n->name == F_recent;
         s.len = xs.n;
+        if (n->elem && !sc->sh) {
+          // the body's text for an element is the same wherever it renders: kept per (for, element, depth)
+          for (long k = 0; k < xs.n; k++) {
+            s.k = k;
+            s.x = arr_at(xs, k);
+            struct { const void *e; int id, depth; } key = { s.x.p, n->tpl, depth };
+            int nw;
+            void **slot = map_put(&elem_text, (Str){ (const char *)&key, sizeof key }, &nw);
+            if (!nw) {
+              Str *c = *slot;
+              put(&O, c->p, c->n);
+              continue;
+            }
+            char *kp = alloc(sizeof key);
+            memcpy(kp, &key, sizeof key);
+            // the map holds the key's bytes: point it at the copy
+            elem_text.k[(void **)slot - elem_text.v].p = kp;
+            Str *c = alloc(sizeof(Str));
+            *slot = c;
+            char *st = O.cur;
+            render(n->body, &s, depth);
+            *c = (Str){ st, O.cur - st };
+          }
+          break;
+        }
         for (long k = 0; k < xs.n; k++) {
           s.k = k;
           s.x = arr_at(xs, k);
@@ -1909,12 +1960,58 @@ static inline long run_inline(const u8 *p, long n) {
   while (i < n && !INLINE_SPECIAL[p[i]]) i++;
   return i;
 }
-/** s rendered inline (makefun-site's inline), into B. */
+/** The text inline renders (a paragraph, an item, a heading): one bit per byte, set where the byte is one inline
+ * treats (\\ ` * [ & < > " ' or below 0x20), found 16 bytes at a time once; every inline call within it (the
+ * recursion renders parts of the same text) reads its specials from these bits. */
+static uint64_t *imask;
+static const char *ibase;
+static void inline_masks(Str s) {
+  long nw = (s.n + 63) / 64;
+  imask = alloc((nw + 1) * sizeof(uint64_t));
+  ibase = s.p;
+  const __m128i a = _mm_set1_epi8('\\'), b = _mm_set1_epi8('`'), c = _mm_set1_epi8('*'), d = _mm_set1_epi8('['),
+                e = _mm_set1_epi8('&'), f = _mm_set1_epi8('<'), g = _mm_set1_epi8('>'), h = _mm_set1_epi8('"'), k = _mm_set1_epi8('\''),
+                lim = _mm_set1_epi8(0x1F);
+  for (long w = 0; w < nw; w++) {
+    uint64_t bits = 0;
+    for (int q = 0; q < 4; q++) {
+      long at = w * 64 + q * 16;
+      __m128i x;
+      if (at + 16 <= s.n) x = _mm_loadu_si128((const __m128i *)(s.p + at));
+      else {
+        char tmp[16];
+        for (int j = 0; j < 16; j++) tmp[j] = at + j < s.n ? s.p[at + j] : 'a';
+        x = _mm_loadu_si128((const __m128i *)tmp);
+      }
+      __m128i m = _mm_or_si128(_mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, a), _mm_cmpeq_epi8(x, b)), _mm_or_si128(_mm_cmpeq_epi8(x, c), _mm_cmpeq_epi8(x, d))),
+                               _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, e), _mm_cmpeq_epi8(x, f)), _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, g), _mm_cmpeq_epi8(x, h)), _mm_cmpeq_epi8(x, k))));
+      m = _mm_or_si128(m, _mm_cmpeq_epi8(_mm_min_epu8(x, lim), x));
+      bits |= (uint64_t)(unsigned)_mm_movemask_epi8(m) << (q * 16);
+    }
+    imask[w] = bits;
+  }
+  imask[nw] = 0;
+}
+/** The first special at or after from in s (a part of the masked text), or s.n. */
+static inline long next_special(Str s, long from) {
+  long off = s.p - ibase;
+  long at = off + from, end = off + s.n;
+  long w = at >> 6;
+  uint64_t bits = imask[w] & (~(uint64_t)0 << (at & 63));
+  while (bits == 0) {
+    w++;
+    if ((w << 6) >= end) return s.n;
+    bits = imask[w];
+  }
+  long pos = (w << 6) + __builtin_ctzll(bits) - off;
+  return pos < s.n ? pos : s.n;
+}
+/** s rendered inline (makefun-site's inline), into B; s is the masked text or a part of it. */
 static void inline_md(Str s) {
   long i = 0;
   while (i < s.n) {
     // a run of plain characters (none of \ ` * [ and nothing to escape) goes at once
-    long r = i + run_inline((const u8 *)s.p + i, s.n - i);
+    long r = next_special(s, i);
     if (r > i) {
       put(&B, s.p + i, r - i);
       i = r;
@@ -2089,9 +2186,12 @@ static Str join_lines(Str *ls, long n) {
 
 /** s's body rendered: html, toc and excerpt (makefun-site's renderMarkdown). */
 #ifdef PROF
-static void inline_top(Str x) { unsigned long long t = rdtsc(); inline_md(x); prof_t[13] += rdtsc() - t; prof_t[14] += x.n; }
+static void inline_top(Str x) { unsigned long long t = rdtsc(); inline_masks(x); inline_md(x); prof_t[13] += rdtsc() - t; prof_t[14] += x.n; }
 #else
-#define inline_top inline_md
+static void inline_top(Str x) {
+  inline_masks(x);
+  inline_md(x);
+}
 #endif
 static void render_md(Src *s) {
   Str src = s->body;
@@ -2420,6 +2520,8 @@ static void build_case(JV *input) {
       }
     }
     chunk_n = 0;
+    elem_n = 0;
+    map_init(&elem_text, 1024);
     for (long k = 0; k < ntpls; k++)
       if (tpls[k].ok) tpls[k].nodes = chunkify(tpls[k].nodes);
     chunk_text = allocz((chunk_n * 9 + 1) * sizeof(Str));
@@ -2736,7 +2838,18 @@ static napi_value build_inner(napi_env envp, napi_callback_info info);
 static napi_value build(napi_env envp, napi_callback_info info) {
   own_fd = 0;
   napi_value r = build_inner(envp, info);
-  if (own_fd) sys3(3, out_fd, 0, 0); // close
+  if (own_fd) {
+    long c = sys3(3, out_fd, 0, 0); // close
+    // A fourth argument true: every answer written and the file closed, the process ends here (exit_group(0)), with
+    // nothing of node's own teardown left to run.
+    bool done = false, quit = false;
+    napi_get_value_bool(envp, r, &done);
+    size_t argc = 4;
+    napi_value argv[4];
+    napi_get_cb_info(envp, info, &argc, argv, 0, 0);
+    if (argc >= 4) napi_get_value_bool(envp, argv[3], &quit);
+    if (done && quit && c == 0) sys3(231, 0, 0, 0);
+  }
   return r;
 }
 static napi_value build_inner(napi_env envp, napi_callback_info info) {
@@ -2771,7 +2884,7 @@ static napi_value build_inner(napi_env envp, napi_callback_info info) {
   } else if (napi_get_buffer_info(envp, argv[0], &data, &len) != napi_ok)
     return nul;
   if (!ready) {
-    if (!arena_init(&P, (size_t)1 << 26) || !arena_init(&A, (size_t)1 << 30) || !arena_init(&B, (size_t)1 << 29) || !arena_init(&O, (size_t)1 << 31)) return nul;
+    if (!arena_init(&P, (size_t)1 << 25) || !arena_init(&A, (size_t)1 << 29) || !arena_init(&B, (size_t)1 << 28) || !arena_init(&O, (size_t)1 << 29)) return nul;
     tables_init();
     const char *esc = "\\`*_[]()#+-.!>";
     for (const char *c = esc; *c; c++) ESCAPABLE[(u8)*c] = 1;

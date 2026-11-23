@@ -4,24 +4,35 @@
 [![rank](https://make.fun/badge/site-generator-speed-01-run-20261122/aditisstillalive/mkfn-site_generator_speed/rank.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 [![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/aditisstillalive/mkfn-site_generator_speed/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 
-A faster drop-in for makefun-site 1.0.0: `solve.js` exports `run(input)`, which returns the same output tree as
-makefun-site's `build(input)`, byte for byte, in less CPU time. An entry for make.fun's
+A faster drop-in for makefun-site 1.0.0: the same output tree as makefun-site's `build(input)` for every case, byte
+for byte, in a fraction of its CPU time. An entry for make.fun's
 [Build a static site faster](https://make.fun/bounty/site-generator-speed-01-run-20261122) bounty.
 
-`solve.js` is self-contained and imports nothing; it keeps makefun-site's rules (front matter, Markdown subset, slug
-rule, template dialect, report) and changes only how they run:
+## How it runs
 
-- inline Markdown, the HTML escape and paragraph lines are scanned with native global regexps (`test()` and
-  `lastIndex`) instead of character by character, and a code block is escaped in one pass;
-- the block lexer works on positions in the body and builds a line's string only where it could open a non-paragraph
-  block;
-- templates are compiled once per build into JavaScript functions, with `for` variables resolved lexically, and every
-  run of template nodes that reads only `site`, `tags` and `recent` (sidebars, tag clouds, footers) is rendered once
-  per build and include depth and reused on every page.
+- **`native/site.c`** is makefun-site's pipeline (front matter, permalinks, its Markdown subset, collections, tags,
+  its template dialect, the report) ported to freestanding C, with no libc, and built into `site.node`, a Node-API
+  addon (`native/build.sh`, x86-64 Linux). `main.ts` loads it with `process.dlopen` and the addon does the rest:
+  it maps `cases.json`, parses each case's JSON itself, builds the site, and writes each answer to `answers.json`
+  already serialized as JSON. No `JSON.parse` of the input, no JavaScript object tree, no `JSON.stringify`.
+- Inside, text stays UTF-8 and is scanned with SSE2: JSON strings, inline Markdown (one bitmask of special bytes
+  per paragraph), HTML and JSON escapes. Markdown is rendered straight into its JSON-escaped form, so a page's
+  content is copied, not escaped again. Template runs that read only `site`, `tags` and `recent` are rendered once
+  per site and include depth, and a `for` body that reads only its element (a post's card) once per element.
+- One rule needs Unicode data the C port does not carry: a slug's NFKD. For text outside ASCII the addon asks
+  JavaScript (`String.prototype.normalize`) once per distinct run of such characters.
+- Exactness first: anything the port does not take on (a character outside the Basic Multilingual Plane, JavaScript
+  whitespace outside ASCII, a lone surrogate, a duplicate template name...) makes the addon give the whole set back,
+  and `solve.js`'s `run(input)` (makefun-site's rules in plain JavaScript, imports nothing) answers every case. The
+  same happens if the addon cannot load.
+- `main.ts` is plain JavaScript with no imports: Node's TypeScript stripping and its ES module loader both cost
+  start-up time, which is part of the timed run.
 
 `vendor/makefun-site/` is the reference program (make.fun's own, MIT, with its LICENSE and NOTICE), kept for
-comparison: `solve.js` was checked against it for byte-identical output on the practice set and on 90 sites drawn by
-the competition's generator from other seeds.
+comparison. Both paths were checked against it for identical answers on the practice set and on 690 sites drawn by
+the competition's generator from other seeds, and two runs write the same bytes.
+
+To rebuild the addon: `native/build.sh` (gcc, x86-64; needs `node_api.h`, e.g. from `/usr/include/node`).
 
 ## Run it
 

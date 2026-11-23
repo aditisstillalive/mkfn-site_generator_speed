@@ -215,6 +215,17 @@ static void putnum(Arena *o, long v) {
 
 // ---------------------------------------------------------------- strings
 
+/** The 1 bits of a 16-bit mask (the popcnt instruction where the build has it; no call to libgcc's either way). */
+static inline int popc16(unsigned x) {
+#ifdef __POPCNT__
+  return __builtin_popcount(x);
+#else
+  x = x - ((x >> 1) & 0x5555);
+  x = (x & 0x3333) + ((x >> 2) & 0x3333);
+  x = (x + (x >> 4)) & 0x0F0F;
+  return (int)((x + (x >> 8)) & 0x1F);
+#endif
+}
 static inline int str_eq(Str a, Str b) { return a.n == b.n && memcmp(a.p, b.p, a.n) == 0; }
 static inline int str_eqc(Str a, const char *c, long n) { return a.n == n && memcmp(a.p, c, n) == 0; }
 #define EQL(a, s) str_eqc(a, s, sizeof(s) - 1)
@@ -2219,13 +2230,13 @@ static void render_md(Src *s) {
     long k = 0;
     for (; k + 16 <= src.n; k += 16) {
       __m128i x = _mm_loadu_si128((const __m128i *)(src.p + k));
-      nl += __builtin_popcount(_mm_movemask_epi8(_mm_cmpeq_epi8(x, NL)));
+      nl += popc16((unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x, NL)));
       // whitespace: space or 9..13
       __m128i ws = _mm_or_si128(_mm_cmpeq_epi8(x, SP), _mm_and_si128(_mm_cmpgt_epi8(x, LO), _mm_cmplt_epi8(x, HI)));
       unsigned w = (unsigned)_mm_movemask_epi8(ws);
       unsigned nonws = ~w & 0xFFFF;
       unsigned shifted = ((w << 1) | prev_ws) & 0xFFFF; // was the byte before whitespace (or the start)
-      words += __builtin_popcount(nonws & shifted);
+      words += popc16(nonws & shifted);
       prev_ws = (w >> 15) & 1;
     }
     for (; k < src.n; k++) {
@@ -3585,7 +3596,11 @@ static napi_value stats(napi_env envp, napi_callback_info info) {
   return arr;
 }
 #endif
-NAPI_MODULE_INIT() {
+// The module's functions on exports. build.sh compiles this file twice into site.node: once for any x86-64 (SSE2), once
+// with -DV3 for x86-64-v3 (AVX2, BMI2...), each with its own copy of everything; the first's module init asks the CPU
+// (cpuid) and hands exports to the second's where the CPU has all of x86-64-v3. Both builds are the same C: their
+// output is the same bytes.
+static napi_value init_exports(napi_env env, napi_value exports) {
   napi_value f;
 #ifdef PROF
   napi_create_function(env, "profStart", NAPI_AUTO_LENGTH, prof_start, 0, &f);
@@ -3611,3 +3626,35 @@ NAPI_MODULE_INIT() {
   napi_set_named_property(env, exports, "closeAnswers", f);
   return exports;
 }
+#ifdef V3
+// default visibility here, so that build.sh's localizing leaves it for the other object to reach; hidden there, so that
+// it is not exported from site.node
+__attribute__((visibility("default"))) napi_value init_v3(napi_env env, napi_value exports) { return init_exports(env, exports); }
+#else
+HIDDEN __attribute__((weak)) napi_value init_v3(napi_env env, napi_value exports);
+static void cpuid(unsigned leaf, unsigned r[4]) {
+  __asm__ volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(leaf), "c"(0));
+}
+/** Whether the CPU (and the OS, for the AVX registers' state) has every feature of x86-64-v3. */
+static int cpu_v3(void) {
+  unsigned r[4];
+  cpuid(0, r);
+  if (r[0] < 7) return 0;
+  cpuid(1, r);
+  // SSE3, SSSE3, FMA, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE, POPCNT, OSXSAVE, AVX, F16C
+  const unsigned c1 = 1u << 0 | 1u << 9 | 1u << 12 | 1u << 13 | 1u << 19 | 1u << 20 | 1u << 22 | 1u << 23 | 1u << 27 |
+                      1u << 28 | 1u << 29;
+  if ((r[2] & c1) != c1) return 0;
+  unsigned lo, hi;
+  __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+  if ((lo & 6) != 6) return 0; // the OS saves the SSE and AVX state
+  cpuid(7, r);
+  const unsigned b7 = 1u << 3 | 1u << 5 | 1u << 8; // BMI1, AVX2, BMI2
+  if ((r[1] & b7) != b7) return 0;
+  cpuid(0x80000000u, r);
+  if (r[0] < 0x80000001u) return 0;
+  cpuid(0x80000001u, r);
+  return (r[2] & (1u << 0 | 1u << 5)) == (1u << 0 | 1u << 5); // LAHF/SAHF, LZCNT
+}
+NAPI_MODULE_INIT() { return init_v3 && cpu_v3() ? init_v3(env, exports) : init_exports(env, exports); }
+#endif

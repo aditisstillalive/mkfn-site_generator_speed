@@ -53,9 +53,16 @@ function slugify(text) {
   return out === '' ? 'untitled' : out;
 }
 
+/**
+ * Unicode's combining marks (\p{M}), as a RegExp made on first use: a literal of it costs V8 about half a millisecond
+ * to check at every start, which a run that never needs it would pay too.
+ */
+let marks = null;
+const MARKS = () => (marks ??= new RegExp('\\p{M}', 'gu'));
+
 /** The slug rule as text.js runs it, for text outside ASCII. */
 function slugifySlow(text) {
-  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  const plain = text.normalize('NFKD').replace(MARKS(), '');
   let out = '';
   let gap = false;
   for (const ch of plain) {
@@ -1135,7 +1142,7 @@ try {
 }
 
 /** A run of characters outside ASCII as a slug reads it: NFKD, its combining marks dropped (slugify's first step). */
-const plainOf = (run) => run.normalize('NFKD').replace(/\p{M}/gu, '');
+const plainOf = (run) => run.normalize('NFKD').replace(MARKS(), '');
 
 /**
  * The answer makefun-site 1.0.0 returns for input: built by site.node where it can (the answer object then also

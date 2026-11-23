@@ -15,7 +15,9 @@ writes `answers.json`. The speed comes from what `run` builds with:
 
 - **`native/site.c`** is makefun-site's pipeline (front matter, permalinks, its Markdown subset, collections, tags,
   its template dialect, the report) ported to freestanding C, with no libc, and built into `site.node`, a Node-API
-  addon (`native/build.sh`, x86-64 Linux). `solve.js` loads it with `process.dlopen`.
+  addon (`native/build.sh`, x86-64 Linux). `solve.js` loads it with `process.dlopen`. The addon holds two builds of
+  the same C, one for any x86-64 and one for x86-64-v3 (AVX2, BMI2...); its module init asks the CPU (`cpuid`) which
+  one to hand out.
 - **Reading.** `readCases` (in the addon) maps `cases.json` and parses it itself into the cases' JavaScript values,
   frozen as they are made, each input remembering the parsed value it came from. ASCII strings are handed to V8 as
   external strings over the mapped file, without a copy.
@@ -39,10 +41,10 @@ writes `answers.json`. The speed comes from what `run` builds with:
   text it holds the more start-up time that takes, which is part of the timed run.
 
 `vendor/makefun-site/` is the reference program (make.fun's own, MIT, with its LICENSE and NOTICE), kept for
-comparison. Both paths were checked against it for identical answers on the practice set and on 870 sites drawn by
+comparison. Both paths were checked against it for identical answers on the practice set and on 1,050 sites drawn by
 the competition's generator from other seeds, and two runs write the same bytes.
 
-To rebuild the addon: `native/build.sh` (gcc, x86-64; needs `node_api.h`, e.g. from `/usr/include/node`).
+To rebuild the addon: `native/build.sh` (gcc and objcopy, x86-64; needs `node_api.h`, e.g. from `/usr/include/node`).
 
 ## Run it
 

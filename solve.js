@@ -905,7 +905,8 @@ const dirOf = (path) => {
   return k === -1 ? '' : path.slice(0, k);
 };
 
-export function run(input) {
+/** makefun-site's build of one case in JavaScript: what run() returns where site.node leaves the case. */
+function runJs(input) {
   // Templates, in code-unit order of their names; one that does not parse is reported.
   const parsed = new Map();
   const reportLines = [];
@@ -1135,6 +1136,38 @@ try {
 
 /** A run of characters outside ASCII as a slug reads it: NFKD, its combining marks dropped (slugify's first step). */
 const plainOf = (run) => run.normalize('NFKD').replace(/\p{M}/gu, '');
+
+/**
+ * The answer makefun-site 1.0.0 returns for input: built by site.node where it can (the answer object then also
+ * carries the JSON text it was built as, which writeAnswers writes), else by runJs.
+ */
+export function run(input) {
+  if (native !== null) {
+    const answer = native.buildOne(input, plainOf);
+    if (answer !== null) return answer;
+  }
+  return runJs(input);
+}
+
+/** cases.json's cases, read by site.node, or null (JSON.parse then reads them). */
+export function readCases(path) {
+  return native === null ? null : native.readCases(path);
+}
+
+/**
+ * answers.json written as the answers come: openAnswers(path) begins it (false where site.node cannot: the caller then
+ * writes it itself), writeAnswer(answer) adds an answer (as the JSON text run() built it as, else as
+ * JSON.stringify's), and closeAnswers(end) ends it, then, with end, the process; false where a write failed.
+ */
+export function openAnswers(path) {
+  return native !== null && native.openAnswers(path) === true;
+}
+export function writeAnswer(answer) {
+  return native.writeAnswer(answer) === true || native.writeText(JSON.stringify(answer)) === true;
+}
+export function closeAnswers(end) {
+  return native.closeAnswers(end) === true;
+}
 
 /** Every case of cases.json's bytes answered as JSON text (a Buffer each, or null where run() must answer), or null. */
 export function runAll(bytes) {

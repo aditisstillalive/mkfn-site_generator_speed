@@ -12,7 +12,7 @@
 // output arena kept to the end; anything a case cannot fit or this port does not take jumps back (longjmp) and that
 // case's answer is null.
 
-#define NAPI_VERSION 8
+#define NAPI_VERSION 10
 #include <node_api.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -130,13 +130,15 @@ static long sys3(long n, long a, long b, long c) {
   __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
   return r;
 }
-static int arena_init(Arena *a, size_t size) {
+static int arena_init2(Arena *a, size_t size, int hp);
+static int arena_init(Arena *a, size_t size) { return arena_init2(a, size, 1); }
+static int arena_init2(Arena *a, size_t size, int hp) {
   const size_t huge = (size_t)1 << 21;
   char *m = sys_mmap(size + huge);
   if (m == 0) return 0;
   a->base = a->cur = (char *)(((uintptr_t)m + huge - 1) & ~(uintptr_t)(huge - 1));
   a->end = a->base + size;
-  sys3(28, (long)a->base, (long)size, 14); // madvise(MADV_HUGEPAGE): fewer faults on first touch, where the kernel allows
+  if (hp) sys3(28, (long)a->base, (long)size, 14); // madvise(MADV_HUGEPAGE): fewer faults on first touch, where the kernel allows
   return 1;
 }
 /** All of p written to fd (write(2), again after a short write or EINTR). */
@@ -2419,6 +2421,10 @@ static int cmp_tag(const void *a, const void *b) {
 
 static Map outkeys;
 static int first_entry;
+// Every entry of the case's answer as written: its key, and its value's span in O (a JSON string's body).
+typedef struct { Str key; char *v0, *v1; } Entry;
+static Entry *ents;
+static long nents, cents;
 static void entry_begin(Str key) {
   set_add(&outkeys, key);
   if (!first_entry) putch(&O, ',');
@@ -2426,8 +2432,20 @@ static void entry_begin(Str key) {
   putch(&O, '"');
   emit_j(&O, key);
   PUTL(&O, "\":\"");
+  if (nents == cents) {
+    long nc = cents ? cents * 2 : 256;
+    Entry *ne = alloc(nc * sizeof(Entry));
+    if (nents) memcpy(ne, ents, nents * sizeof(Entry));
+    ents = ne;
+    cents = nc;
+  }
+  ents[nents].key = key;
+  ents[nents].v0 = O.cur;
 }
-static inline void entry_end(void) { putch(&O, '"'); }
+static inline void entry_end(void) {
+  ents[nents++].v1 = O.cur;
+  putch(&O, '"');
+}
 
 static Str dir_of(Str p) {
   long k = p.n - 1;
@@ -2744,6 +2762,9 @@ static void build_case(JV *input) {
   // 7. layouts
   map_init(&outkeys, nsrc + ntags + nposts / 1 + 16);
   first_entry = 1;
+  nents = 0;
+  cents = 0;
+  ents = 0;
   putch(&O, '{');
   Scope root;
   memset(&root, 0, sizeof root);
@@ -2845,6 +2866,25 @@ static void build_case(JV *input) {
 // ---------------------------------------------------------------- Node-API
 
 static int ready;
+static uint64_t gen; // buildOne's calls: an answer's text stays in O until the next
+typedef struct { Str t; uint64_t gen; } Rec;
+static Arena R; // the cases' strings readCases hands to JavaScript (kept to the end)
+static Arena U; // answers' strings recoded for JavaScript, which reads them where they are (kept to the end)
+static Arena W; // writeText's scratch
+static int init_once(void) {
+  if (ready) return 1;
+  if (!arena_init(&P, (size_t)1 << 25) || !arena_init(&A, (size_t)1 << 29) || !arena_init(&B, (size_t)1 << 28) ||
+      !arena_init(&O, (size_t)1 << 29) || !arena_init2(&R, (size_t)1 << 28, 0) || !arena_init2(&U, (size_t)1 << 31, 0) || !arena_init2(&W, (size_t)1 << 26, 0))
+    return 0;
+  tables_init();
+  const char *esc = "\\`*_[]()#+-.!>";
+  for (const char *c = esc; *c; c++) ESCAPABLE[(u8)*c] = 1;
+  const char *sp = "\\`*[&<>\"'";
+  for (const char *c = sp; *c; c++) INLINE_SPECIAL[(u8)*c] = 1;
+  for (int c = 0; c < 0x20; c++) INLINE_SPECIAL[c] = 1;
+  ready = 1;
+  return 1;
+}
 static int own_fd;
 static long out_fd = -1;
 static napi_value build_inner(napi_env envp, napi_callback_info info);
@@ -2897,16 +2937,7 @@ static napi_value build_inner(napi_env envp, napi_callback_info info) {
     data = (void *)r;
   } else if (napi_get_buffer_info(envp, argv[0], &data, &len) != napi_ok)
     return nul;
-  if (!ready) {
-    if (!arena_init(&P, (size_t)1 << 25) || !arena_init(&A, (size_t)1 << 29) || !arena_init(&B, (size_t)1 << 28) || !arena_init(&O, (size_t)1 << 29)) return nul;
-    tables_init();
-    const char *esc = "\\`*_[]()#+-.!>";
-    for (const char *c = esc; *c; c++) ESCAPABLE[(u8)*c] = 1;
-    const char *sp = "\\`*[&<>\"'";
-    for (const char *c = sp; *c; c++) INLINE_SPECIAL[(u8)*c] = 1;
-    for (int c = 0; c < 0x20; c++) INLINE_SPECIAL[c] = 1;
-    ready = 1;
-  }
+  if (!init_once()) return nul;
   genv = envp;
   gslug = argv[1];
   // With an fd (the third argument): the answers array written straight to it, each case built in the output arena
@@ -3021,6 +3052,498 @@ static napi_value build_inner(napi_env envp, napi_callback_info info) {
   return result;
 }
 
+
+// ---------------------------------------------------------------- the driver's API: readCases, buildOne (run's), writeAnswers
+//
+// readCases(path): cases.json's cases as JavaScript values, parsed here (its strings handed over without a copy where
+// they are ASCII), or null where the file holds what this parser leaves to JSON.parse. buildOne(input, plainOf):
+// run(input)'s answer, read from the input object and built here; the answer object is frozen and remembers the
+// JSON text it was built from, or null where the input holds what the C port leaves (run() then answers in
+// JavaScript). writeAnswers(answers, path, end): answers.json written from the texts of frozen answers buildOne made
+// (false, nothing written, when any answer is not one), then, with end, the process ended.
+
+static void *alloc_in(Arena *a, size_t n) {
+  n = (n + 7) & ~(size_t)7;
+  if ((size_t)(a->end - a->cur) < n) unsupported();
+  void *p = a->cur;
+  a->cur += n;
+  return p;
+}
+static inline int all_ascii(const char *p, long n) {
+  long i = 0;
+  for (; i + 16 <= n; i += 16)
+    if (_mm_movemask_epi8(_mm_loadu_si128((const __m128i *)(p + i)))) return 0;
+  for (; i < n; i++)
+    if ((u8)p[i] >= 0x80) return 0;
+  return 1;
+}
+/** UTF-8 (no lone surrogates, no character past the Basic Multilingual Plane) from p into UTF-16 at u; its length. */
+static long utf8_to_16(const u8 *p, long n, uint16_t *u, long k) {
+  const __m128i z = _mm_setzero_si128();
+  for (long i = 0; i < n;) {
+    if (i + 16 <= n) {
+      // ASCII 16 bytes a step, widened
+      __m128i x = _mm_loadu_si128((const __m128i *)(p + i));
+      unsigned m = _mm_movemask_epi8(x);
+      _mm_storeu_si128((__m128i *)(u + k), _mm_unpacklo_epi8(x, z));
+      _mm_storeu_si128((__m128i *)(u + k + 8), _mm_unpackhi_epi8(x, z));
+      int a = m ? __builtin_ctz(m) : 16;
+      i += a;
+      k += a;
+      if (a == 16) continue;
+    }
+    u8 c = p[i];
+    if (c < 0x80) {
+      u[k++] = c;
+      i++;
+    } else if (c >= 0xC2 && c < 0xE0 && i + 1 < n) {
+      u[k++] = (uint16_t)(((c & 0x1F) << 6) | (p[i + 1] & 0x3F));
+      i += 2;
+    } else if (c >= 0xE0 && c < 0xF0 && i + 2 < n) {
+      uint16_t v = (uint16_t)(((c & 0x0F) << 12) | ((p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F));
+      if (v >= 0xD800 && v < 0xE000) unsupported();
+      u[k++] = v;
+      i += 3;
+    } else
+      unsupported();
+  }
+  return k;
+}
+static napi_value js_external(napi_env env, const char *p, long n, int latin1) {
+  napi_value v;
+  bool copied;
+  if (latin1) {
+    if (n > 0 && node_api_create_external_string_latin1(env, (char *)p, n, 0, 0, &v, &copied) == napi_ok) return v;
+    if (napi_create_string_latin1(env, p, n, &v) != napi_ok) unsupported();
+    return v;
+  }
+  if (n > 0 && node_api_create_external_string_utf16(env, (char16_t *)p, n, 0, 0, &v, &copied) == napi_ok) return v;
+  if (napi_create_string_utf16(env, (const char16_t *)p, n, &v) != napi_ok) unsupported();
+  return v;
+}
+/** A JavaScript string of s (UTF-8, its bytes kept to the end): ASCII over its own bytes, the rest as UTF-16 in U. */
+static napi_value js_str(napi_env env, Str s) {
+  if (all_ascii(s.p, s.n)) return js_external(env, s.p, s.n, 1);
+  uint16_t *u = alloc(s.n * 2 + 2);
+  long k = utf8_to_16((const u8 *)s.p, s.n, u, 0);
+  return js_external(env, (const char *)u, k, 0);
+}
+/** A JavaScript string of j, a JSON string's body as build_case writes it (its escapes \" \\ \n \r \t \b \f \u00XX),
+ * j lying in O (read up to 16 bytes past its end). ASCII decodes to bytes, anything else to UTF-16, 16 bytes a step. */
+static napi_value js_copy(napi_env env, const char *p, long n, int latin1);
+static inline u8 unesc(const u8 *e, long *adv) {
+  *adv = 2;
+  switch (e[1]) {
+    case 'n': return '\n';
+    case 'r': return '\r';
+    case 't': return '\t';
+    case 'b': return '\b';
+    case 'f': return '\f';
+    case 'u': *adv = 6; return (u8)((hexv(e[4]) << 4) | hexv(e[5]));
+    default: return e[1];
+  }
+}
+static napi_value js_of_json(napi_env env, Str j) {
+  const u8 *p = (const u8 *)j.p, *pe = p + j.n;
+  if ((const char *)pe + 16 > O.end) unsupported();
+  int ascii = all_ascii(j.p, j.n);
+  const __m128i bs = _mm_set1_epi8('\\');
+  if (ascii) {
+    u8 *b = alloc_in(&U, j.n + 32), *o = b;
+    while (p < pe) {
+      __m128i x = _mm_loadu_si128((const __m128i *)p);
+      _mm_storeu_si128((__m128i *)o, x);
+      unsigned m = _mm_movemask_epi8(_mm_cmpeq_epi8(x, bs));
+      if (m == 0) {
+        p += 16;
+        o += 16;
+        continue;
+      }
+      int k = __builtin_ctz(m);
+      p += k;
+      o += k;
+      if (p >= pe) break;
+      long adv;
+      *o++ = unesc(p, &adv);
+      p += adv;
+    }
+    o -= p - pe; // the last step's bytes past the end
+    U.cur = (char *)(((uintptr_t)o + 7) & ~(uintptr_t)7);
+    return js_external(env, (const char *)b, o - b, 1);
+  }
+  uint16_t *u = alloc_in(&U, j.n * 2 + 64), *o = u;
+  const __m128i z = _mm_setzero_si128();
+  while (p < pe) {
+    __m128i x = _mm_loadu_si128((const __m128i *)p);
+    _mm_storeu_si128((__m128i *)o, _mm_unpacklo_epi8(x, z));
+    _mm_storeu_si128((__m128i *)(o + 8), _mm_unpackhi_epi8(x, z));
+    unsigned m = _mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(x, bs), x));
+    if (m == 0) {
+      p += 16;
+      o += 16;
+      continue;
+    }
+    int k = __builtin_ctz(m);
+    p += k;
+    o += k;
+    if (p >= pe) break;
+    u8 c = *p;
+    if (c == '\\') {
+      long adv;
+      *o++ = unesc(p, &adv);
+      p += adv;
+    } else if (c < 0xE0) {
+      *o++ = (uint16_t)(((c & 0x1F) << 6) | (p[1] & 0x3F));
+      p += 2;
+    } else {
+      *o++ = (uint16_t)(((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F));
+      p += 3;
+    }
+  }
+  o -= p - pe;
+  U.cur = (char *)(((uintptr_t)o + 7) & ~(uintptr_t)7);
+  return js_external(env, (const char *)u, o - u, 0);
+}
+static napi_value js_copy(napi_env env, const char *p, long n, int latin1) {
+  napi_value v;
+  if ((latin1 ? napi_create_string_latin1(env, p, n, &v) : napi_create_string_utf16(env, (const char16_t *)p, n, &v)) != napi_ok) unsupported();
+  return v;
+}
+static void *map_file(napi_env env, napi_value pathv, size_t *lenp) {
+  char path[4096];
+  size_t pn;
+  if (napi_get_value_string_utf8(env, pathv, path, sizeof path, &pn) != napi_ok || pn >= sizeof path - 1) return 0;
+  long in = sys3(2, (long)path, 0, 0);
+  if (in < 0) return 0;
+  long st[18];
+  if (sys3(5, in, (long)st, 0) != 0) return 0;
+  size_t len = (size_t)st[6];
+  if (len == 0) return 0;
+  register long r10 __asm__("r10") = 0x02 | 0x8000; // MAP_PRIVATE | MAP_POPULATE
+  register long r8 __asm__("r8") = in;
+  register long r9 __asm__("r9") = 0;
+  long r;
+  __asm__ volatile("syscall" : "=a"(r) : "a"(9), "D"(0), "S"(len), "d"(1), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+  sys3(3, in, 0, 0);
+  if (r < 0 && r > -4096) return 0;
+  *lenp = len;
+  return (void *)r;
+}
+static napi_value jv_to_js(napi_env env, JV *v) {
+  napi_value r;
+  switch (v->t) {
+    case J_NULL: napi_get_null(env, &r); return r;
+    case J_BOOL: napi_get_boolean(env, v->num != 0, &r); return r;
+    case J_NUM:
+      if (!v->isint) unsupported();
+      napi_create_double(env, (double)v->num, &r);
+      return r;
+    case J_STR: return js_str(env, v->s);
+    case J_ARR:
+      napi_create_array_with_length(env, v->n, &r);
+      for (long i = 0; i < v->n; i++) napi_set_element(env, r, i, jv_to_js(env, &v->kids[i]));
+      if (napi_object_freeze(env, r) != napi_ok) unsupported();
+      return r;
+    default:
+      napi_create_object(env, &r);
+      for (long i = 0; i < v->n; i++) {
+        if (EQL(v->keys[i], "__proto__")) unsupported();
+        napi_value k;
+        if (node_api_create_property_key_utf8(env, v->keys[i].p, v->keys[i].n, &k) != napi_ok) unsupported();
+        napi_set_property(env, r, k, jv_to_js(env, &v->kids[i]));
+      }
+      // frozen as made: what readCases hands out stays what its value says (buildOne reads the value)
+      if (napi_object_freeze(env, r) != napi_ok) unsupported();
+      return r;
+  }
+}
+static napi_value read_cases(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], nul, result;
+  napi_get_cb_info(env, info, &argc, argv, 0, 0);
+  napi_get_null(env, &nul);
+  if (argc < 1 || !init_once()) return nul;
+  size_t len;
+  const u8 *data = map_file(env, argv[0], &len);
+  if (!data) return nul;
+  {
+    // R's pages made ready in one call: the decoded strings (at most the file's bytes) and their UTF-16 (twice that)
+    uintptr_t from = ((uintptr_t)R.cur + 4095) & ~(uintptr_t)4095, to = ((uintptr_t)R.cur + 3 * len + 4095) & ~(uintptr_t)4095;
+    if (to > (uintptr_t)R.end) to = (uintptr_t)R.end;
+    if (to > from) sys3(28, (long)from, (long)(to - from), 23); // MADV_POPULATE_WRITE
+  }
+  Arena keepA = A;
+  A = R; // the strings decoded here outlive the call: they back the JavaScript strings
+  if (__builtin_setjmp(jb) != 0) {
+    A = keepA;
+    return nul;
+  }
+  jp = data;
+  je = data + len;
+  jws();
+  if (jp >= je || *jp != '[') unsupported();
+  jp++;
+  napi_create_array(env, &result);
+  jws();
+  if (jp < je && *jp == ']') jp++;
+  else
+    for (uint32_t k = 0;; k++) {
+      JV *c = jval(0);
+      napi_value cv = jv_to_js(env, c);
+      // the input object (frozen all through) remembers the value it was made from: buildOne then reads that
+      JV *in = jget(c, "input");
+      if (in && in->t == J_OBJ) {
+        napi_value iv;
+        if (napi_get_named_property(env, cv, "input", &iv) != napi_ok || napi_wrap(env, iv, in, 0, 0, 0) != napi_ok) unsupported();
+      }
+      napi_set_element(env, result, k, cv);
+      jws();
+      if (jp < je && *jp == ',') {
+        jp++;
+        continue;
+      }
+      if (jp < je && *jp == ']') {
+        jp++;
+        break;
+      }
+      unsupported();
+    }
+  jws();
+  if (jp != je) unsupported();
+  R = A;
+  A = keepA;
+  return result;
+}
+
+// input object -> the JV build_case reads
+static Str js_get_str(napi_env env, napi_value v) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t != napi_string) unsupported();
+  size_t n16, n;
+  if (napi_get_value_string_utf16(env, v, 0, 0, &n16) != napi_ok) unsupported();
+  char *b = alloc(n16 * 3 + 1);
+  if (napi_get_value_string_utf8(env, v, b, n16 * 3 + 1, &n) != napi_ok) unsupported();
+  // what the port leaves: as in JSON (check_high), and U+FFFD, which a lone surrogate reads as
+  for (size_t i = 0; i < n; i++)
+    if ((u8)b[i] >= 0x80) {
+      if ((u8)b[i] == 0xEF && i + 2 < n && (u8)b[i + 1] == 0xBF && (u8)b[i + 2] == 0xBD) unsupported();
+      check_high((const u8 *)b + i);
+    }
+  return (Str){ b, (long)n };
+}
+static napi_value js_get(napi_env env, napi_value o, const char *name) {
+  napi_valuetype t;
+  napi_typeof(env, o, &t);
+  if (t != napi_object) unsupported();
+  napi_value v;
+  if (napi_get_named_property(env, o, name, &v) != napi_ok) unsupported();
+  return v;
+}
+static JV *jv_obj(long n) {
+  JV *o = allocz(sizeof(JV));
+  o->t = J_OBJ;
+  o->n = n;
+  o->kids = allocz((n ? n : 1) * sizeof(JV));
+  o->keys = allocz((n ? n : 1) * sizeof(Str));
+  return o;
+}
+static void jv_set_str(JV *o, long i, const char *key, Str s) {
+  long kn = 0;
+  while (key[kn]) kn++;
+  o->keys[i] = (Str){ key, kn };
+  o->kids[i].t = J_STR;
+  o->kids[i].s = s;
+}
+static void jv_set_num(napi_env env, JV *o, long i, const char *key, napi_value v) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t != napi_number) unsupported();
+  double d;
+  napi_get_value_double(env, v, &d);
+  if (!(d >= -1e15 && d <= 1e15) || d != (double)(long)d) unsupported();
+  long kn = 0;
+  while (key[kn]) kn++;
+  o->keys[i] = (Str){ key, kn };
+  o->kids[i].t = J_NUM;
+  o->kids[i].isint = 1;
+  o->kids[i].num = (long)d;
+}
+static JV *input_of(napi_env env, napi_value input) {
+  JV *in = jv_obj(3);
+  napi_value site = js_get(env, input, "site"), templates = js_get(env, input, "templates"), files = js_get(env, input, "files");
+  JV *s = jv_obj(4);
+  jv_set_str(s, 0, "title", js_get_str(env, js_get(env, site, "title")));
+  jv_set_str(s, 1, "base_url", js_get_str(env, js_get(env, site, "base_url")));
+  jv_set_num(env, s, 2, "per_page", js_get(env, site, "per_page"));
+  jv_set_num(env, s, 3, "recent", js_get(env, site, "recent"));
+  in->keys[0] = LIT("site");
+  in->kids[0] = *s;
+  // templates: own enumerable string keys
+  napi_valuetype t;
+  napi_typeof(env, templates, &t);
+  if (t != napi_object) unsupported();
+  napi_value names;
+  if (napi_get_all_property_names(env, templates, napi_key_own_only, napi_key_enumerable | napi_key_skip_symbols, napi_key_numbers_to_strings, &names) != napi_ok) unsupported();
+  uint32_t nt;
+  napi_get_array_length(env, names, &nt);
+  JV *tp = jv_obj(nt);
+  for (uint32_t k = 0; k < nt; k++) {
+    napi_value key, val;
+    napi_get_element(env, names, k, &key);
+    Str ks = js_get_str(env, key);
+    if (napi_get_property(env, templates, key, &val) != napi_ok) unsupported();
+    tp->keys[k] = ks;
+    tp->kids[k].t = J_STR;
+    tp->kids[k].s = js_get_str(env, val);
+  }
+  in->keys[1] = LIT("templates");
+  in->kids[1] = *tp;
+  bool isarr;
+  napi_is_array(env, files, &isarr);
+  if (!isarr) unsupported();
+  uint32_t nf;
+  napi_get_array_length(env, files, &nf);
+  JV *fl = allocz(sizeof(JV));
+  fl->t = J_ARR;
+  fl->n = nf;
+  fl->kids = allocz((nf ? nf : 1) * sizeof(JV));
+  for (uint32_t k = 0; k < nf; k++) {
+    napi_value f;
+    napi_get_element(env, files, k, &f);
+    JV *fo = jv_obj(2);
+    jv_set_str(fo, 0, "path", js_get_str(env, js_get(env, f, "path")));
+    jv_set_str(fo, 1, "content", js_get_str(env, js_get(env, f, "content")));
+    fl->kids[k] = *fo;
+  }
+  in->keys[2] = LIT("files");
+  in->kids[2] = *fl;
+  return in;
+}
+static napi_value build_one(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2], nul;
+  napi_get_cb_info(env, info, &argc, argv, 0, 0);
+  napi_get_null(env, &nul);
+  if (argc < 2 || !init_once()) return nul;
+  genv = env;
+  gslug = argv[1];
+  A.cur = A.base;
+  B.cur = B.base;
+  O.cur = O.base; // the last answer's text is given up (its record's generation no longer matches)
+  gen++;
+  char *volatile o0 = O.cur;
+  if (__builtin_setjmp(jb) != 0) return nul;
+#ifdef PROF
+  prof_last = rdtsc();
+#endif
+  void *wrapped = 0;
+  JV *in = napi_unwrap(env, argv[0], &wrapped) == napi_ok && wrapped ? (JV *)wrapped : input_of(env, argv[0]);
+  PHASE(12);
+  build_case(in);
+  PHASE(13);
+  {
+    // the answer's strings land in U: its pages made ready in one call (at most two bytes a byte of JSON text), not
+    // faulted in one by one
+    uintptr_t from = ((uintptr_t)U.cur + 4095) & ~(uintptr_t)4095, to = ((uintptr_t)U.cur + 2 * (O.cur - o0) + 64 * nents + 4095) & ~(uintptr_t)4095;
+    if (to > (uintptr_t)U.end) to = (uintptr_t)U.end;
+    if (to > from) sys3(28, (long)from, (long)(to - from), 23); // MADV_POPULATE_WRITE (an older kernel refuses it: no harm)
+  }
+  napi_value obj;
+  napi_create_object(env, &obj);
+  for (long i = 0; i < nents; i++) {
+    if (EQL(ents[i].key, "__proto__")) unsupported();
+    napi_value k;
+    if (node_api_create_property_key_utf8(env, ents[i].key.p, ents[i].key.n, &k) != napi_ok) unsupported();
+    PHASE(9);
+    napi_value jv = js_of_json(env, (Str){ ents[i].v0, ents[i].v1 - ents[i].v0 });
+    PHASE(10);
+    if (napi_set_property(env, obj, k, jv) != napi_ok) unsupported();
+    PHASE(11);
+  }
+  Rec *rec = palloc(sizeof(Rec));
+  *rec = (Rec){ { o0, O.cur - o0 }, gen };
+  if (napi_wrap(env, obj, rec, 0, 0, 0) != napi_ok) unsupported();
+  PHASE(15);
+  if (napi_object_freeze(env, obj) != napi_ok) unsupported();
+  PHASE(14);
+  return obj;
+}
+static long ans_fd = -1, ans_n;
+static int ans_ok;
+static int ans_put(const char *p, long n) {
+  if (ans_ok && !write_all(ans_fd, p, n)) ans_ok = 0;
+  return ans_ok;
+}
+/** openAnswers(path): answers.json opened (truncated) and its array begun; false where it cannot be. */
+static napi_value open_answers(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], r;
+  napi_get_cb_info(env, info, &argc, argv, 0, 0);
+  char path[4096];
+  size_t pn;
+  int ok = argc >= 1 && init_once() && napi_get_value_string_utf8(env, argv[0], path, sizeof path, &pn) == napi_ok && pn < sizeof path - 1;
+  if (ok) {
+    ans_fd = sys3(2, (long)path, 01 | 0100 | 01000, 0644);
+    ans_n = 0;
+    ans_ok = ans_fd >= 0;
+    ok = ans_put("[", 1);
+  }
+  napi_get_boolean(env, ok, &r);
+  return r;
+}
+/** writeAnswer(answer): the answer's JSON text, as buildOne built it, appended; false (nothing written) where answer is
+ * not buildOne's latest answer. writeText(text): text appended as an answer's JSON (JSON.stringify's). */
+static napi_value write_answer(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], r;
+  napi_get_cb_info(env, info, &argc, argv, 0, 0);
+  void *p = 0;
+  Rec *rec;
+  int ok = argc >= 1 && ans_ok && napi_unwrap(env, argv[0], &p) == napi_ok && p != 0 && (rec = p)->gen == gen;
+  if (ok) ok = ans_put(",", ans_n++ ? 1 : 0) && ans_put(rec->t.p, rec->t.n);
+  napi_get_boolean(env, ok, &r);
+  return r;
+}
+static napi_value write_text(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], r;
+  napi_get_cb_info(env, info, &argc, argv, 0, 0);
+  int ok = 0;
+  size_t n16, n;
+  if (argc >= 1 && ans_ok && napi_get_value_string_utf16(env, argv[0], 0, 0, &n16) == napi_ok) {
+    if ((size_t)(W.end - W.base) > n16 * 3 + 1) {
+      char *b = W.base;
+      if (napi_get_value_string_utf8(env, argv[0], b, n16 * 3 + 1, &n) == napi_ok)
+        ok = ans_put(",", ans_n++ ? 1 : 0) && ans_put(b, n);
+    } else {
+      // larger than the scratch: through a mapping of its own
+      char *b = sys_mmap(n16 * 3 + 1);
+      if (b && napi_get_value_string_utf8(env, argv[0], b, n16 * 3 + 1, &n) == napi_ok)
+        ok = ans_put(",", ans_n++ ? 1 : 0) && ans_put(b, n);
+    }
+  }
+  if (!ok) ans_ok = 0;
+  napi_get_boolean(env, ok, &r);
+  return r;
+}
+/** closeAnswers(end): the array ended and the file closed; true where every write went through, and then, with end,
+ * the process ended. */
+static napi_value close_answers(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], r;
+  napi_get_cb_info(env, info, &argc, argv, 0, 0);
+  int ok = ans_put("]", 1);
+  if (ans_fd >= 0 && sys3(3, ans_fd, 0, 0) != 0) ok = 0;
+  ans_fd = -1;
+  ans_ok = 0;
+  bool end = false;
+  if (argc >= 1) napi_get_value_bool(env, argv[0], &end);
+  if (ok && end) sys3(231, 0, 0, 0); // every answer written and the file closed: the process ends here
+  napi_get_boolean(env, ok, &r);
+  return r;
+}
+
 #ifdef PROF
 // A sampling profiler: SIGPROF every 100 µs of CPU, each sample the interrupted instruction's address.
 static unsigned long samples[1 << 20];
@@ -3074,5 +3597,17 @@ NAPI_MODULE_INIT() {
 #endif
   napi_create_function(env, "build", NAPI_AUTO_LENGTH, build, 0, &f);
   napi_set_named_property(env, exports, "build", f);
+  napi_create_function(env, "readCases", NAPI_AUTO_LENGTH, read_cases, 0, &f);
+  napi_set_named_property(env, exports, "readCases", f);
+  napi_create_function(env, "buildOne", NAPI_AUTO_LENGTH, build_one, 0, &f);
+  napi_set_named_property(env, exports, "buildOne", f);
+  napi_create_function(env, "openAnswers", NAPI_AUTO_LENGTH, open_answers, 0, &f);
+  napi_set_named_property(env, exports, "openAnswers", f);
+  napi_create_function(env, "writeAnswer", NAPI_AUTO_LENGTH, write_answer, 0, &f);
+  napi_set_named_property(env, exports, "writeAnswer", f);
+  napi_create_function(env, "writeText", NAPI_AUTO_LENGTH, write_text, 0, &f);
+  napi_set_named_property(env, exports, "writeText", f);
+  napi_create_function(env, "closeAnswers", NAPI_AUTO_LENGTH, close_answers, 0, &f);
+  napi_set_named_property(env, exports, "closeAnswers", f);
   return exports;
 }

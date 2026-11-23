@@ -1116,3 +1116,29 @@ export function run(input) {
   output[REPORT_FILE] = `${lines.join('\n')}\n`;
   return output;
 }
+
+// ---------------------------------------------------------------- the native build
+
+/**
+ * site.node (built from native/site.c): makefun-site's build in C over /input/cases.json's bytes. Each case's answer
+ * comes back already written as JSON (a Buffer), or null for a case it leaves to run() (see native/site.c). Absent or
+ * unloadable, runAll returns null and every case goes through run().
+ */
+let native = null;
+try {
+  const m = { exports: {} };
+  process.dlopen(m, new URL('./site.node', import.meta.url).pathname);
+  native = m.exports;
+} catch {
+  native = null;
+}
+
+/** A run of characters outside ASCII as a slug reads it: NFKD, its combining marks dropped (slugify's first step). */
+const plainOf = (run) => run.normalize('NFKD').replace(/\p{M}/gu, '');
+
+/** Every case of cases.json's bytes answered as JSON text (a Buffer each, or null where run() must answer), or null. */
+export function runAll(bytes) {
+  if (native === null) return null;
+  const parts = native.build(bytes, plainOf);
+  return Array.isArray(parts) ? parts : null;
+}

@@ -8,8 +8,20 @@ A faster drop-in for makefun-site 1.0.0: `solve.js` exports `run(input)`, which 
 makefun-site's `build(input)`, byte for byte, in less CPU time. An entry for make.fun's
 [Build a static site faster](https://make.fun/bounty/site-generator-speed-01-run-20261122) bounty.
 
-`vendor/makefun-site/` is the reference program (make.fun's own, MIT, with its LICENSE and NOTICE); it is kept only so
-the tests can compare against it.
+`solve.js` is self-contained and imports nothing; it keeps makefun-site's rules (front matter, Markdown subset, slug
+rule, template dialect, report) and changes only how they run:
+
+- inline Markdown, the HTML escape and paragraph lines are scanned with native global regexps (`test()` and
+  `lastIndex`) instead of character by character, and a code block is escaped in one pass;
+- the block lexer works on positions in the body and builds a line's string only where it could open a non-paragraph
+  block;
+- templates are compiled once per build into JavaScript functions, with `for` variables resolved lexically, and every
+  run of template nodes that reads only `site`, `tags` and `recent` (sidebars, tag clouds, footers) is rendered once
+  per build and include depth and reused on every page.
+
+`vendor/makefun-site/` is the reference program (make.fun's own, MIT, with its LICENSE and NOTICE), kept for
+comparison: `solve.js` was checked against it for byte-identical output on the practice set and on 90 sites drawn by
+the competition's generator from other seeds.
 
 ## Run it
 

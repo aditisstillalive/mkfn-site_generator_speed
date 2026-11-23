@@ -295,9 +295,18 @@ static int has_js_ws(Str s) {
 
 typedef struct { Str *k; void **v; uint32_t cap, n; } Map;
 static inline uint32_t hash(Str s) {
-  uint32_t h = 2166136261u;
-  for (long i = 0; i < s.n; i++) h = (h ^ (u8)s.p[i]) * 16777619u;
-  return h;
+  // 8 bytes a step (multiply and fold), the rest byte by byte
+  uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)s.n;
+  long i = 0;
+  for (; i + 8 <= s.n; i += 8) {
+    uint64_t w;
+    __builtin_memcpy(&w, s.p + i, 8);
+    h = (h ^ w) * 0xff51afd7ed558ccdull;
+    h ^= h >> 32;
+  }
+  for (; i < s.n; i++) h = (h ^ (u8)s.p[i]) * 0x100000001b3ull;
+  h ^= h >> 29;
+  return (uint32_t)h;
 }
 static void map_init(Map *m, uint32_t hint) {
   uint32_t cap = 16;
@@ -1972,12 +1981,16 @@ static void inline_masks(Str s) {
   const __m128i a = _mm_set1_epi8('\\'), b = _mm_set1_epi8('`'), c = _mm_set1_epi8('*'), d = _mm_set1_epi8('['),
                 e = _mm_set1_epi8('&'), f = _mm_set1_epi8('<'), g = _mm_set1_epi8('>'), h = _mm_set1_epi8('"'), k = _mm_set1_epi8('\''),
                 lim = _mm_set1_epi8(0x1F);
+  // Reading past the text's end is safe where the text lies in the arena A (its room runs on): whole blocks are read
+  // and the bits past the end cleared. Elsewhere the last block is padded.
+  int over = s.p >= A.base && s.p + nw * 64 <= A.end;
   for (long w = 0; w < nw; w++) {
     uint64_t bits = 0;
     for (int q = 0; q < 4; q++) {
       long at = w * 64 + q * 16;
       __m128i x;
-      if (at + 16 <= s.n) x = _mm_loadu_si128((const __m128i *)(s.p + at));
+      if (at + 16 <= s.n || over) x = _mm_loadu_si128((const __m128i *)(s.p + at));
+      else if (at >= s.n) x = _mm_set1_epi8('a');
       else {
         char tmp[16];
         for (int j = 0; j < 16; j++) tmp[j] = at + j < s.n ? s.p[at + j] : 'a';
@@ -1990,6 +2003,7 @@ static void inline_masks(Str s) {
     }
     imask[w] = bits;
   }
+  if (nw > 0 && (s.n & 63)) imask[nw - 1] &= ((uint64_t)1 << (s.n & 63)) - 1;
   imask[nw] = 0;
 }
 /** The first special at or after from in s (a part of the masked text), or s.n. */

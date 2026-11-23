@@ -12,7 +12,7 @@ for byte, in a fraction of its CPU time. An entry for make.fun's
 
 - **`native/site.c`** is makefun-site's pipeline (front matter, permalinks, its Markdown subset, collections, tags,
   its template dialect, the report) ported to freestanding C, with no libc, and built into `site.node`, a Node-API
-  addon (`native/build.sh`, x86-64 Linux). `main.ts` loads it with `process.dlopen` and the addon does the rest:
+  addon (`native/build.sh`, x86-64 Linux). `run.js` loads it with `process.dlopen` and the addon does the rest:
   it maps `cases.json`, parses each case's JSON itself, builds the site, and writes each answer to `answers.json`
   already serialized as JSON. No `JSON.parse` of the input, no JavaScript object tree, no `JSON.stringify`.
 - Inside, text stays UTF-8 and is scanned with SSE2: JSON strings, inline Markdown (one bitmask of special bytes
@@ -25,8 +25,9 @@ for byte, in a fraction of its CPU time. An entry for make.fun's
   whitespace outside ASCII, a lone surrogate, a duplicate template name...) makes the addon give the whole set back,
   and `solve.js`'s `run(input)` (makefun-site's rules in plain JavaScript, imports nothing) answers every case. The
   same happens if the addon cannot load.
-- `main.ts` is plain JavaScript with no imports: Node's TypeScript stripping and its ES module loader both cost
-  start-up time, which is part of the timed run.
+- `main.ts` is one line, `import './run.js';`: Node strips TypeScript from `main.ts` before it runs, and the more
+  text it holds the more start-up time that takes, which is part of the timed run. `run.js` imports nothing (an
+  import costs start-up time too) and ends the process as soon as `answers.json` is written and closed.
 
 `vendor/makefun-site/` is the reference program (make.fun's own, MIT, with its LICENSE and NOTICE), kept for
 comparison. Both paths were checked against it for identical answers on the practice set and on 690 sites drawn by
